@@ -1,0 +1,108 @@
+package de.christian.weckersync
+
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.MessageDigest
+import java.security.cert.CertificateException
+import java.security.cert.X509Certificate
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.X509TrustManager
+
+class ApiException(message: String) : IOException(message)
+data class Reply(val status: Int, val body: String)
+
+object Network {
+    fun fingerprint(cert: X509Certificate): String = MessageDigest.getInstance("SHA-256")
+        .digest(cert.encoded).joinToString("") { "%02x".format(it.toInt() and 255) }
+
+    private fun tls(pin: String?, capture: ((X509Certificate) -> Unit)? = null): SSLContext {
+        val trust = object : X509TrustManager {
+            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+            override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {
+                throw CertificateException("Client certificates unsupported")
+            }
+            override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {
+                val leaf = chain.firstOrNull() ?: throw CertificateException("Zertifikat fehlt")
+                leaf.checkValidity()
+                if (capture != null) capture(leaf) // Pairing only: no API token or application request.
+                else if (pin == null || !fingerprint(leaf).equals(pin, true)) {
+                    throw CertificateException("Hue-Zertifikat geändert. In Einstellungen erneut prüfen und koppeln.")
+                }
+            }
+        }
+        return SSLContext.getInstance("TLS").apply { init(null, arrayOf(trust), null) }
+    }
+
+    /** Capture only a TLS certificate. Explicit user confirmation is required before storing it. */
+    fun inspectHue(host: String): String {
+        Config.validateHost(host)
+        var fingerprint: String? = null
+        val socket = tls(null) { fingerprint = Network.fingerprint(it) }.socketFactory.createSocket() as javax.net.ssl.SSLSocket
+        socket.use {
+            it.soTimeout = 6000
+            it.connect(java.net.InetSocketAddress(host, 443), 6000)
+            it.startHandshake()
+        }
+        return fingerprint ?: throw ApiException("Hue-Zertifikat konnte nicht gelesen werden.")
+    }
+
+    fun call(url: String, method: String = "GET", body: String? = null,
+             headers: Map<String, String> = emptyMap(), huePin: String? = null): Reply {
+        if (Thread.currentThread().isInterrupted) throw InterruptedException()
+        val connection = URL(url).openConnection() as HttpURLConnection
+        try {
+            connection.connectTimeout = 6000
+            connection.readTimeout = 6000
+            connection.instanceFollowRedirects = false // Never forward keys to redirect targets.
+            connection.useCaches = false
+            connection.requestMethod = method
+            connection.setRequestProperty("Cache-Control", "no-cache, no-store")
+            headers.forEach { (name, value) -> connection.setRequestProperty(name, value) }
+            if (huePin != null) {
+                require(connection is HttpsURLConnection)
+                connection.sslSocketFactory = tls(huePin).socketFactory
+                val expectedHost = URL(url).host
+                // Identity is the explicitly approved exact leaf certificate, not its IP SAN.
+                connection.hostnameVerifier = javax.net.ssl.HostnameVerifier { host, session ->
+                    host == expectedHost && runCatching {
+                        fingerprint(session.peerCertificates[0] as X509Certificate).equals(huePin, true)
+                    }.getOrDefault(false)
+                }
+            }
+            if (body != null) {
+                connection.doOutput = true
+                connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            }
+            val code = connection.responseCode
+            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val data = stream?.use {
+                val output = java.io.ByteArrayOutputStream()
+                val buffer = ByteArray(8192)
+                while (true) {
+                    val count = it.read(buffer)
+                    if (count < 0) break
+                    output.write(buffer, 0, count)
+                    if (output.size() > 2_000_000) throw ApiException("Antwort ist unerwartet groß.")
+                }
+                output.toString("UTF-8")
+            }.orEmpty()
+            return Reply(code, data)
+        } finally { connection.disconnect() }
+    }
+    fun success(reply: Reply): String {
+        if (reply.status !in 200..299) throw ApiException("HTTP ${reply.status}. Adresse, Berechtigung und Erreichbarkeit prüfen.")
+        return reply.body
+    }
+    fun userError(e: Exception): String = when (e) {
+        is ApiException -> e.message.orEmpty()
+        is javax.net.ssl.SSLException -> "TLS/Zertifikat abgelehnt. Hue-Kopplung bzw. HTTPS-Zertifikat prüfen."
+        is java.net.SocketTimeoutException -> "Zeitüberschreitung. WLAN und Gerät prüfen."
+        is java.net.UnknownHostException -> "Hostname nicht gefunden. Adresse prüfen."
+        is java.net.ConnectException -> "Verbindung abgelehnt. IP, Port und Gerät prüfen."
+        is java.io.IOException -> "Netzwerkfehler. Verbindung prüfen."
+        is IllegalArgumentException -> e.message ?: "Ungültige Konfiguration."
+        else -> "Antwort konnte nicht verarbeitet werden (${e.javaClass.simpleName})."
+    } // Never show URLs, request bodies, tokens or arbitrary remote error text.
+}

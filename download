@@ -1,0 +1,58 @@
+package de.christian.weckersync
+
+/** Device operations are injectable so partial failure and write uncertainty can be tested. */
+interface AlarmGateway {
+    fun readMaster(): Boolean
+    fun writeMaster(value: Boolean)
+    fun syncHue(value: Boolean)
+    fun syncSonos(value: Boolean)
+}
+data class SyncResult(
+    val master: Boolean? = null,
+    val iob: String = "Noch nicht geprüft",
+    val hue: String = "Noch nicht geprüft",
+    val sonos: String = "Noch nicht geprüft",
+    val ok: Boolean = false,
+    val time: Long = 0L,
+    val masterTime: Long = 0L
+)
+class SyncEngine(private val gateway: AlarmGateway) {
+    fun cycle(requested: Boolean? = null): SyncResult {
+        var writeError: String? = null
+        if (requested != null) {
+            try { gateway.writeMaster(requested) }
+            catch (e: InterruptedException) { throw e }
+            catch (e: Exception) { writeError = Network.userError(e) }
+        }
+        val target = try { gateway.readMaster() }
+        catch (e: InterruptedException) { throw e }
+        catch (e: Exception) {
+            return SyncResult(iob = Network.userError(e), hue = "Nicht geprüft: ioBroker nicht lesbar",
+                sonos = "Nicht geprüft: ioBroker nicht lesbar", time = System.currentTimeMillis())
+        }
+        val readTime = System.currentTimeMillis()
+        val iobStatus = when {
+            requested != null && target != requested -> "Schaltwunsch nicht bestätigt. Aktueller Serverzustand wird verwendet."
+            writeError != null -> "Schreibantwort unklar; Zustand durch Rücklesen bestätigt."
+            else -> "Erreichbar · ${if (target) "AN" else "AUS"}"
+        }
+        var success = requested == null || requested == target
+        fun attempt(block: () -> Unit): String = try {
+            block()
+            "Bestätigt · ${if (target) "AN" else "AUS"}"
+        } catch (e: InterruptedException) { throw e }
+          catch (e: Exception) { success = false; Network.userError(e) }
+        val hueStatus = attempt { gateway.syncHue(target) }
+        val sonosStatus = attempt { gateway.syncSonos(target) }
+        // Detect an external toggle while device requests were in progress; next cycle rereads.
+        val current = try { gateway.readMaster() }
+        catch (e: InterruptedException) { throw e }
+        catch (e: Exception) {
+            return SyncResult(target, "Abschlussprüfung fehlgeschlagen: ${Network.userError(e)}",
+                hueStatus, sonosStatus, false, System.currentTimeMillis(), readTime)
+        }
+        if (current != target) return SyncResult(current, "Serverzustand während Abgleich geändert; erneuter Abgleich folgt.",
+            "Erneuter Abgleich nötig", "Erneuter Abgleich nötig", false, System.currentTimeMillis(), System.currentTimeMillis())
+        return SyncResult(target, iobStatus, hueStatus, sonosStatus, success, System.currentTimeMillis(), System.currentTimeMillis())
+    }
+}

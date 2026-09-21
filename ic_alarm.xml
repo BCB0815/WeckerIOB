@@ -1,0 +1,97 @@
+package de.christian.weckersync
+
+import android.Manifest
+import android.app.Activity
+import android.app.AlertDialog
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.*
+import android.provider.Settings
+import android.widget.*
+import java.text.DateFormat
+import java.util.Date
+
+class MainActivity : Activity() {
+    private lateinit var master: Switch
+    private lateinit var state: TextView
+    private lateinit var devices: TextView
+    private lateinit var monitor: Button
+    private lateinit var settings: Button
+    private lateinit var refresh: Button
+    private var rendering = false
+    private var localPendingUntil = 0L
+    private val handler = Handler(Looper.getMainLooper())
+    private val ticker = object : Runnable {
+        override fun run() { render(); handler.postDelayed(this, 500) }
+    }
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val root = Ui.page(this, "Wecker Sync")
+        Ui.text(this, root, "Ein Schalter für Hue und Sonos", 18)
+        state = Ui.text(this, root, "Noch nicht verbunden", 22)
+        master = Switch(this).apply {
+            text = "Wecker aktiv"; textSize = 22f
+            setPadding(0, Ui.dp(this@MainActivity, 20), 0, Ui.dp(this@MainActivity, 20))
+            root.addView(this)
+            setOnCheckedChangeListener { _, value ->
+                if (!rendering) {
+                    localPendingUntil = SystemClock.elapsedRealtime() + 1500
+                    isEnabled = false
+                    startService(Intent(this@MainActivity, SyncService::class.java).setAction(SyncService.SET).putExtra("value", value))
+                }
+            }
+        }
+        devices = Ui.text(this, root, "", 16)
+        monitor = Ui.button(this, root, "Überwachung starten") {
+            if (SyncService.running) stopService(Intent(this, SyncService::class.java))
+            else {
+                try {
+                    ConfigStore(this).load().validate()
+                    if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 10)
+                    }
+                    startForegroundService(Intent(this, SyncService::class.java))
+                } catch (e: Exception) {
+                    AlertDialog.Builder(this).setTitle("Einstellungen prüfen").setMessage(Network.userError(e)).setPositiveButton("OK", null).show()
+                }
+            }
+            render()
+        }
+        refresh = Ui.button(this, root, "Jetzt erneut abgleichen") {
+            localPendingUntil = SystemClock.elapsedRealtime() + 1500
+            startService(Intent(this, SyncService::class.java).setAction(SyncService.REFRESH))
+            render()
+        }
+        settings = Ui.button(this, root, "Einstellungen") { startActivity(Intent(this, SettingsActivity::class.java)) }
+        Ui.button(this, root, "Android-Akkueinstellungen") {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:$packageName")))
+        }
+        Ui.text(this, root, "Die App prüft etwa alle 15 Sekunden, zuzüglich Netzwerkzeit. Für laufenden Abgleich Hintergrundnutzung erlauben und Akku auf ‚Uneingeschränkt‘ stellen. Android kann die Ausführung trotzdem verzögern.\n\nStoppen der Überwachung ändert keine Wecker. Nach Handy-Neustart oder Beenden der App durch Android die Überwachung erneut starten.\n\nAN/AUS aktiviert oder deaktiviert bestehende Gerätewecker. Es beendet keine bereits laufende Musik oder Beleuchtung.", 14)
+        render()
+    }
+    private fun render() {
+        if (!::master.isInitialized) return
+        val r = SyncService.result
+        val active = SyncService.running
+        val busy = SyncService.busy || SyncService.commandPending || SystemClock.elapsedRealtime() < localPendingUntil
+        val fresh = r.masterTime > 0 && System.currentTimeMillis() - r.masterTime < 60_000
+        rendering = true
+        master.isChecked = r.master == true
+        master.isEnabled = active && !busy && fresh
+        rendering = false
+        state.text = when {
+            !active -> "Überwachung gestoppt"
+            busy -> "Abgleich läuft …"
+            !fresh -> "Serverzustand unbekannt oder veraltet"
+            r.ok -> if (r.master == true) "Wecker sind aktiv" else "Wecker sind aus"
+            else -> "Abgleich unvollständig"
+        }
+        val time = if (r.time == 0L) "Noch keine Prüfung" else "Letzter Abgleich: ${DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM).format(Date(r.time))}"
+        devices.text = "ioBroker\n${r.iob}\n\nPhilips Hue\n${r.hue}\n\nSonos\n${r.sonos}\n\n$time" + if (!active || !fresh) "\nAngaben sind keine aktuelle Gerätebestätigung." else ""
+        monitor.text = if (active) "Überwachung stoppen" else "Überwachung starten"
+        settings.isEnabled = !active
+        refresh.isEnabled = active && !busy
+    }
+    override fun onResume() { super.onResume(); handler.post(ticker) }
+    override fun onPause() { handler.removeCallbacks(ticker); super.onPause() }
+}

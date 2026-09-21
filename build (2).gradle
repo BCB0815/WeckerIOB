@@ -1,0 +1,49 @@
+package de.christian.weckersync
+
+import android.app.Activity
+import android.graphics.Color
+import android.graphics.Typeface
+import android.view.View
+import android.widget.*
+
+object Ui {
+    fun dp(activity: Activity, value: Int): Int = (value * activity.resources.displayMetrics.density).toInt()
+    fun page(activity: Activity, title: String): LinearLayout {
+        val scroll = ScrollView(activity).apply { isFillViewport = true }
+        val layout = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(activity, 24), dp(activity, 20), dp(activity, 24), dp(activity, 32))
+        }
+        scroll.addView(layout)
+        activity.setContentView(scroll)
+        // Handle Android 15 edge-to-edge and keyboards without hiding controls under system bars.
+        scroll.setOnApplyWindowInsetsListener { view, insets ->
+            @Suppress("DEPRECATION")
+            view.setPadding(insets.systemWindowInsetLeft, insets.systemWindowInsetTop, insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
+            insets
+        }
+        scroll.requestApplyInsets()
+        text(activity, layout, title, 30).setTypeface(null, Typeface.BOLD)
+        return layout
+    }
+    fun text(a: Activity, root: LinearLayout, value: String, size: Int = 16): TextView = TextView(a).apply {
+        text = value; textSize = size.toFloat(); setTextColor(Color.rgb(26, 48, 42))
+        setPadding(0, dp(a, 10), 0, dp(a, 10))
+        root.addView(this)
+    }
+    fun button(a: Activity, root: LinearLayout, title: String, action: () -> Unit): Button = Button(a).apply {
+        text = title; isAllCaps = false
+        root.addView(this, LinearLayout.LayoutParams(-1, -2))
+        setOnClickListener { action() }
+    }
+    fun field(a: Activity, root: LinearLayout, label: String, initial: String, idNumber: Int, secret: Boolean = false): EditText {
+        val labelView = text(a, root, label, 14)
+        return EditText(a).apply {
+            id = idNumber; setText(initial); setSingleLine(true)
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or (if (secret) android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD else android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
+            if (secret) importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            labelView.labelFor = id
+            root.addView(this, LinearLayout.LayoutParams(-1, -2))
+        }
+    }
+}

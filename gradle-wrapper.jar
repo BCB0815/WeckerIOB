@@ -1,0 +1,44 @@
+package de.christian.weckersync
+
+import java.net.URI
+
+class SonosApi(private val c: Config) {
+    private val base = "http://${c.sonosHost}:1400"
+    private var endpoint: String? = null
+    private fun controlUrl(): String {
+        endpoint?.let { return it }
+        val doc = SonosXml.parse(Network.success(Network.call("$base/xml/device_description.xml")))
+        val service = SonosXml.elements(doc, "service").firstOrNull {
+            it.getElementsByTagNameNS("*", "serviceType").item(0)?.textContent == SonosXml.SERVICE
+        } ?: throw ApiException("Dieser Sonos bietet keinen lokalen AlarmClock-Dienst an.")
+        val path = service.getElementsByTagNameNS("*", "controlURL").item(0)?.textContent
+            ?: throw ApiException("Sonos-Control-URL fehlt.")
+        val resolved = URI("$base/").resolve(path)
+        if (resolved.scheme != "http" || resolved.host != c.sonosHost || resolved.port != 1400 || resolved.userInfo != null) {
+            throw ApiException("Sonos-Control-URL verweist auf ein fremdes Ziel.")
+        }
+        return resolved.toString().also { endpoint = it }
+    }
+    private fun soap(action: String, args: Map<String, String> = emptyMap()): org.w3c.dom.Document {
+        val reply = Network.call(controlUrl(), "POST", SonosXml.envelope(action, args),
+            mapOf("Content-Type" to "text/xml; charset=\"utf-8\"", "SOAPACTION" to "\"${SonosXml.SERVICE}#$action\""))
+        if (reply.status !in 200..299) {
+            // Preserve SOAP error codes, but never display arbitrary network content.
+            runCatching { SonosXml.parse(reply.body) }.getOrNull()?.let {
+                if (SonosXml.elements(it, "Fault").isNotEmpty()) SonosXml.checkSoap(it, action)
+            }
+            Network.success(reply)
+        }
+        return SonosXml.parse(reply.body).also { SonosXml.checkSoap(it, action) }
+    }
+    fun list(): List<Map<String, String>> = SonosXml.alarms(soap("ListAlarms"))
+    private fun alarm(): Map<String, String> = list().singleOrNull { it["ID"] == c.alarmId }
+        ?: throw ApiException("Sonos Alarm-ID ${c.alarmId} nicht eindeutig gefunden. In Einstellungen auswählen.")
+    fun reconcile(target: Boolean) {
+        val old = alarm()
+        if (SonosXml.enabled(old) != target) {
+            soap("UpdateAlarm", SonosXml.updateArgs(old, target))
+            if (SonosXml.enabled(alarm()) != target) throw ApiException("Sonos hat den gewünschten Zustand noch nicht bestätigt; erneuter Versuch folgt.")
+        }
+    }
+}
