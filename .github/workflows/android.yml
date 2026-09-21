@@ -1,0 +1,56 @@
+name: Android APK bauen
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Tests und APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Projekt laden
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Java 17 einrichten
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK einrichten
+        uses: android-actions/setup-android@v4
+        with:
+          cmdline-tools-version: '12266719'
+          packages: 'platform-tools platforms;android-35 build-tools;34.0.0'
+
+      - name: Tests ausführen und Debug-APK bauen
+        run: bash ./gradlew --no-daemon --stacktrace testDebugUnitTest assembleDebug
+
+      - name: APK zum Download bereitstellen
+        uses: actions/upload-artifact@v7
+        with:
+          name: WeckerSync-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Testberichte bereitstellen
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: WeckerSync-Testberichte
+          path: |
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/test-results/testDebugUnitTest/
+          if-no-files-found: ignore
+          retention-days: 14
